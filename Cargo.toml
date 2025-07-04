@@ -1,0 +1,23 @@
+[package]
+name = "phab-comments-to-md"
+version = "0.1.0"
+edition = "2021"
+authors = ["Paul Adenot <padenot@mozilla.com>"]
+description = "Extract Phabricator review comments and format them as Markdown for analysis by LLM agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/padenot/phab-comments-to-md"
+keywords = ["phabricator", "markdown", "code-review", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+scraper = "0.20"
+regex = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+url = "2.5"
+indicatif = "0.17"
