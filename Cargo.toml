@@ -21,3 +21,5 @@ tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 url = "2.5"
 indicatif = "0.17"
+rusqlite = "0.32"
+dirs = "5.0"

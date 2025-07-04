@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use url::Url;
+use rusqlite::{Connection, OpenFlags};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -199,19 +200,505 @@ impl PhabricatorCommentExtractor {
         }
     }
 
+    async fn extract_firefox_cookies(&self, domain: &str) -> Result<HashMap<String, String>> {
+        // Try environment variable first for manual cookie specification
+        if let Ok(cookie_env) = std::env::var("PHABRICATOR_COOKIES") {
+            let mut cookies = HashMap::new();
+            for cookie_pair in cookie_env.split(';') {
+                let cookie_pair = cookie_pair.trim();
+                if let Some((name, value)) = cookie_pair.split_once('=') {
+                    cookies.insert(name.trim().to_string(), value.trim().to_string());
+                }
+            }
+            if cookies.contains_key("phsid") && cookies.contains_key("phusr") {
+                return Ok(cookies);
+            }
+        }
+
+        // Extract cookies directly from Firefox SQLite database
+        self.extract_cookies_from_firefox_db(domain).await
+    }
+
+    async fn extract_cookies_from_firefox_db(&self, domain: &str) -> Result<HashMap<String, String>> {
+        let profile_dir = self.find_firefox_profile_dir(domain).await?;
+        let cookies_db_path = profile_dir.join("cookies.sqlite");
+
+        if !cookies_db_path.exists() {
+            anyhow::bail!("Firefox cookies database not found at: {}", cookies_db_path.display());
+        }
+
+        // Open database in immutable mode (handle locked databases)
+        let (conn, temp_db) = match Connection::open_with_flags(&cookies_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => (conn, None),
+            Err(e) if e.to_string().contains("database is locked") => {
+                let temp_db = std::env::temp_dir().join(format!("cookies_extract_{}.sqlite", std::process::id()));
+                std::fs::copy(&cookies_db_path, &temp_db)?;
+                let conn = Connection::open_with_flags(&temp_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                (conn, Some(temp_db))
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT host, name, value FROM moz_cookies WHERE host LIKE ?1"
+        )?;
+
+        let domain_pattern = format!("%{}%", domain);
+        let cookie_iter = stmt.query_map([&domain_pattern], |row| {
+            Ok((
+                row.get::<_, String>(1)?, // name
+                row.get::<_, String>(2)?, // value
+            ))
+        })?;
+
+        let mut cookies = HashMap::new();
+        for cookie_result in cookie_iter {
+            let (name, value) = cookie_result?;
+            cookies.insert(name, value);
+        }
+
+        // Ensure we have the required cookies
+        if !cookies.contains_key("phsid") || !cookies.contains_key("phusr") {
+            anyhow::bail!("Required cookies (phsid, phusr) not found for domain: {}. Found cookies: {:?}", 
+                         domain, cookies.keys().collect::<Vec<_>>());
+        }
+
+        
+        // Clean up temporary database if used
+        if let Some(temp_path) = temp_db {
+            let _ = std::fs::remove_file(temp_path);
+        }
+        
+        Ok(cookies)
+    }
+
+    async fn find_firefox_profile_dir(&self, domain: &str) -> Result<std::path::PathBuf> {
+        let firefox_dir = if cfg!(target_os = "windows") {
+            dirs::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+                .join("Mozilla").join("Firefox").join("Profiles")
+        } else if cfg!(target_os = "macos") {
+            dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+                .join("Library").join("Application Support").join("Firefox").join("Profiles")
+        } else {
+            // Linux and other Unix-like systems
+            dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+                .join(".mozilla").join("firefox")
+        };
+
+        if !firefox_dir.exists() {
+            anyhow::bail!("Firefox directory not found: {}", firefox_dir.display());
+        }
+
+        // Find all profile directories
+        let mut profiles = Vec::new();
+        for entry in std::fs::read_dir(&firefox_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                let cookies_db = path.join("cookies.sqlite");
+                if cookies_db.exists() {
+                    if let Ok(metadata) = cookies_db.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            profiles.push((path, modified));
+                        }
+                    }
+                }
+            }
+        }
+
+        if profiles.is_empty() {
+            anyhow::bail!("No Firefox profiles with cookies.sqlite found in: {}", firefox_dir.display());
+        }
+
+        // Sort by modification time (most recent first)
+        profiles.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Take the most recent profile that has the required cookies
+        let domain_pattern = format!("%{}%", domain);
+        
+        for (profile_path, _modified) in profiles {
+            let cookies_db = profile_path.join("cookies.sqlite");
+            
+            // Try to read cookies from this profile
+            match Connection::open_with_flags(&cookies_db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+                Ok(conn) => {
+                    // Check if we can find the required cookies
+                    if let Ok(mut stmt) = conn.prepare(
+                        "SELECT COUNT(*) FROM moz_cookies WHERE host LIKE ?1 AND (name = 'phsid' OR name = 'phusr')"
+                    ) {
+                        if let Ok(count) = stmt.query_row([&domain_pattern], |row| row.get::<_, i32>(0)) {
+                            if count >= 2 {
+                                return Ok(profile_path);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Check if it's a database lock error
+                    if e.to_string().contains("database is locked") || e.to_string().contains("database disk image is malformed") {
+                        // Try to copy the database and read from the copy
+                        let temp_db = std::env::temp_dir().join(format!("cookies_temp_{}.sqlite", std::process::id()));
+                        if let Ok(_) = std::fs::copy(&cookies_db, &temp_db) {
+                            if let Ok(conn) = Connection::open_with_flags(&temp_db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+                                if let Ok(mut stmt) = conn.prepare(
+                                    "SELECT COUNT(*) FROM moz_cookies WHERE host LIKE ?1 AND (name = 'phsid' OR name = 'phusr')"
+                                ) {
+                                    if let Ok(count) = stmt.query_row([&domain_pattern], |row| row.get::<_, i32>(0)) {
+                                        if count >= 2 {
+                                            // Clean up temp file
+                                            let _ = std::fs::remove_file(&temp_db);
+                                            return Ok(profile_path);
+                                        }
+                                    }
+                                }
+                            }
+                            // Clean up temp file
+                            let _ = std::fs::remove_file(&temp_db);
+                        }
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("No Firefox profile found with required Phabricator cookies")
+    }
+
+    async fn get_csrf_token_with_cookies(&self, revision_id: u32, domain: &str) -> Option<String> {
+        let url = format!("{}/D{}", self.base_url, revision_id);
+        let mut request_builder = self.client.get(&url);
+        
+        // Add Firefox cookies for authentication
+        if let Ok(cookies) = self.extract_firefox_cookies(domain).await {
+            let mut cookie_string = String::new();
+            for (name, value) in cookies {
+                if !cookie_string.is_empty() {
+                    cookie_string.push_str("; ");
+                }
+                cookie_string.push_str(&format!("{}={}", name, value));
+            }
+            if !cookie_string.is_empty() {
+                request_builder = request_builder.header("Cookie", cookie_string);
+            }
+        }
+        
+        if let Ok(response) = request_builder.send().await {
+            if let Ok(html) = response.text().await {
+                // Look for CSRF token in the HTML
+                let csrf_re = regex::Regex::new(r#"__csrf__.*?value="([^"]+)""#).unwrap();
+                if let Some(captures) = csrf_re.captures(&html) {
+                    return Some(captures.get(1)?.as_str().to_string());
+                }
+                
+                // Alternative pattern
+                let csrf_re2 = regex::Regex::new(r#""current":"([^"]+)""#).unwrap();
+                if let Some(captures) = csrf_re2.captures(&html) {
+                    return Some(captures.get(1)?.as_str().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Fetches JavaScript-rendered suggestions from Phabricator web interface
+    /// using authenticated AJAX requests with extracted ref parameters
     async fn fetch_suggestion_from_web(&self, revision_id: u32, line_number: u32, file_path: &str, include_done: bool) -> Option<String> {
-        // Try the AJAX changeset endpoint first
         if let Some(changeset_data) = self.fetch_changeset_data(revision_id).await {
-            // Parse the AJAX response for suggestions
             if let Some(suggestions) = self.parse_suggestions_from_ajax(&changeset_data, line_number, file_path, include_done).await {
                 return Some(suggestions);
             }
         }
+        None
+    }
+
+
+    async fn get_changeset_ids(&self, revision_id: u32) -> Vec<String> {
+        // First get the changeset IDs from the differential API
+        let revision_phid = match self.get_revision_phid(revision_id).await {
+            Ok(phid) => phid,
+            Err(_) => return Vec::new(),
+        };
+
+        // Get transactions to find diff information
+        let transactions = match self.get_transactions(&revision_phid).await {
+            Ok(trans) => trans,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut changeset_ids = Vec::new();
+
+        // Look for differential diff information in transactions
+        for transaction in transactions {
+            if let Some(fields) = transaction.fields {
+                // Check for diff field that might contain changeset information
+                if let Some(diff_field) = fields.get("diff") {
+                    if let Some(diff_obj) = diff_field.as_object() {
+                        if let Some(id) = diff_obj.get("id") {
+                            if let Some(id_str) = id.as_str() {
+                                changeset_ids.push(id_str.to_string());
+                            } else if let Some(id_num) = id.as_u64() {
+                                changeset_ids.push(id_num.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we didn't find changeset IDs in transactions, try the direct diff API
+        if changeset_ids.is_empty() {
+            if let Some(diff_id) = self.get_latest_diff_id(revision_id).await {
+                changeset_ids.push(diff_id);
+            }
+        }
+
+        changeset_ids
+    }
+
+    async fn get_latest_diff_id(&self, revision_id: u32) -> Option<String> {
+        // Try to get the latest diff ID by searching for diffs of this revision
+        let url = format!("{}/api/differential.diff.search", self.base_url);
+        let params = [
+            ("api.token", self.api_token.as_str()),
+            ("constraints[revisionIDs][0]", &revision_id.to_string()),
+            ("order", "newest"),
+            ("limit", "1"),
+        ];
+
+        match self.client.post(&url).form(&params).send().await {
+            Ok(response) => {
+                if let Ok(result) = response.json::<serde_json::Value>().await {
+                    if let Some(data) = result.get("result").and_then(|r| r.get("data")).and_then(|d| d.as_array()) {
+                        if let Some(first_diff) = data.first() {
+                            if let Some(diff_id) = first_diff.get("id") {
+                                if let Some(id_str) = diff_id.as_str() {
+                                    return Some(id_str.to_string());
+                                } else if let Some(id_num) = diff_id.as_u64() {
+                                    return Some(id_num.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        None
+    }
+
+    /// Extracts ref parameters from Phabricator revision page HTML for AJAX requests
+    async fn extract_ref_parameters_from_page(&self, revision_id: u32) -> Vec<String> {
+        let url = format!("{}/D{}", self.base_url, revision_id);
         
+        // Try to extract Firefox cookies for authentication
+        let domain = if let Ok(parsed_url) = Url::parse(&self.base_url) {
+            parsed_url.host_str().unwrap_or("phabricator.services.mozilla.com").to_string()
+        } else {
+            "phabricator.services.mozilla.com".to_string()
+        };
+        
+        let mut request_builder = self.client.get(&url);
+        
+        // Add Firefox cookies if available
+        if let Ok(cookies) = self.extract_firefox_cookies(&domain).await {
+            if !cookies.is_empty() {
+                let mut cookie_string = String::new();
+                for (name, value) in cookies {
+                    if !cookie_string.is_empty() {
+                        cookie_string.push_str("; ");
+                    }
+                    cookie_string.push_str(&format!("{}={}", name, value));
+                }
+                request_builder = request_builder.header("Cookie", cookie_string);
+            }
+        }
+        
+        match request_builder.send().await {
+            Ok(response) => {
+                if let Ok(html) = response.text().await {
+                    // Extract all ref parameters from the HTML using regex
+                    let re = regex::Regex::new(r#"ref=(\d+)"#).unwrap();
+                    let mut refs = Vec::new();
+                    
+                    for captures in re.captures_iter(&html) {
+                        if let Some(ref_match) = captures.get(1) {
+                            let ref_value = ref_match.as_str().to_string();
+                            if !refs.contains(&ref_value) {
+                                refs.push(ref_value);
+                            }
+                        }
+                    }
+                    
+                    // If no refs found with simple pattern, try more comprehensive search
+                    if refs.is_empty() {
+                        // Try looking for refs in various JavaScript formats
+                        let patterns = vec![
+                            r#""ref":"(\d+)""#,           // JSON: "ref":"123456"
+                            r#"'ref':\s*'(\d+)'"#,        // JS: 'ref': '123456'
+                            r#"ref:\s*'(\d+)'"#,          // JS: ref: '123456'
+                            r#"ref:\s*(\d+)"#,            // JS: ref: 123456
+                            r#"\bC(\d{7,8})[ON]L\d+"#,    // HTML IDs like C8450617OL1, C8450617NL1
+                        ];
+                        
+                        for pattern in patterns {
+                            let re = regex::Regex::new(pattern).unwrap();
+                            for captures in re.captures_iter(&html) {
+                                if let Some(ref_match) = captures.get(1) {
+                                    let ref_value = ref_match.as_str().to_string();
+                                    if !refs.contains(&ref_value) && ref_value.len() >= 7 {
+                                        refs.push(ref_value);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Look for changeset IDs in JavaScript data or JSON (7-8 digit numbers)
+                        if refs.is_empty() {
+                            let js_re = regex::Regex::new(r"\b\d{7,8}\b").unwrap();
+                            for js_match in js_re.find_iter(&html) {
+                                let ref_value = js_match.as_str().to_string();
+                                if !refs.contains(&ref_value) {
+                                    refs.push(ref_value);
+                                }
+                            }
+                        }
+                        
+                        // Try to find them in differential/ URLs specifically
+                        let diff_re = regex::Regex::new(r"differential/changeset/[^?]*\?[^&]*ref=(\d+)").unwrap();
+                        for captures in diff_re.captures_iter(&html) {
+                            if let Some(ref_match) = captures.get(1) {
+                                let ref_value = ref_match.as_str().to_string();
+                                if !refs.contains(&ref_value) {
+                                    refs.push(ref_value);
+                                }
+                            }
+                        }
+                    }
+                    
+                    refs
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(_) => Vec::new()
+        }
+    }
+
+    async fn fetch_changeset_with_refs(&self, revision_id: u32, ref_params: &[String]) -> Option<String> {
+        // Get domain for Firefox cookies
+        let domain = if let Ok(parsed_url) = Url::parse(&self.base_url) {
+            parsed_url.host_str().unwrap_or("phabricator.services.mozilla.com").to_string()
+        } else {
+            "phabricator.services.mozilla.com".to_string()
+        };
+
+        // Get CSRF token first (this also needs cookies)
+        let csrf_token = self.get_csrf_token_with_cookies(revision_id, &domain).await.unwrap_or_else(|| "dummy".to_string());
+
+        // Set up the AJAX request similar to the curl command
+        let changeset_url = format!("{}/differential/changeset/", self.base_url);
+
+        let headers = [
+            ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0"),
+            ("Accept", "*/*"),
+            ("Accept-Language", "en-US,en;q=0.5"),
+            ("Accept-Encoding", "gzip, deflate, br"),
+            ("X-Phabricator-Csrf", &csrf_token),
+            ("X-Phabricator-Via", &format!("/D{}", revision_id)),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Origin", &self.base_url),
+            ("Connection", "keep-alive"),
+            ("Sec-Fetch-Dest", "empty"),
+            ("Sec-Fetch-Mode", "cors"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ];
+
+        // Try each ref parameter and prioritize those with suggestionText
+        let mut best_response = None;
+        let mut best_score = 0;
+        
+        for ref_param in ref_params {
+            let form_data = [
+                ("ref", ref_param.as_str()),
+                ("device", "1up"),
+                ("__wflow__", "true"),
+                ("__ajax__", "true"),
+                ("__metablock__", "7"),
+            ];
+
+            let mut request = self.client.post(&changeset_url);
+            for (key, value) in headers.iter() {
+                request = request.header(*key, *value);
+            }
+            
+            // Add Firefox cookies for authentication
+            if let Ok(cookies) = self.extract_firefox_cookies(&domain).await {
+                let mut cookie_string = String::new();
+                for (name, value) in cookies {
+                    if !cookie_string.is_empty() {
+                        cookie_string.push_str("; ");
+                    }
+                    cookie_string.push_str(&format!("{}={}", name, value));
+                }
+                if !cookie_string.is_empty() {
+                    request = request.header("Cookie", cookie_string);
+                }
+            }
+
+            match request.form(&form_data).send().await {
+                Ok(response) => {
+                    if let Ok(text) = response.text().await {
+                        
+                        // Check if this response contains suggestions and score it
+                        let has_suggestion_text = text.contains("suggestionText");
+                        let has_inline_view = text.contains("inline-suggestion-view");
+                        let has_inline_comment = text.contains("differential-inline-comment");
+                        
+                        
+                        // Score responses: suggestionText > inline-suggestion-view > differential-inline-comment
+                        let mut score = 0;
+                        if has_suggestion_text { score += 100; }
+                        if has_inline_view { score += 10; }
+                        if has_inline_comment { score += 1; }
+                        
+                        if score > best_score {
+                            best_score = score;
+                            best_response = Some(text);
+                        }
+                        
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        
+        if let Some(response) = best_response {
+            return Some(response);
+        }
+
         None
     }
 
     async fn fetch_changeset_data(&self, revision_id: u32) -> Option<String> {
+        // First try to extract ref parameters from the initial page
+        let ref_params = self.extract_ref_parameters_from_page(revision_id).await;
+        
+        if !ref_params.is_empty() {
+            // Use the extracted ref parameters directly
+            if let Some(result) = self.fetch_changeset_with_refs(revision_id, &ref_params).await {
+                return Some(result);
+            }
+        }
+        
+        // Fallback: Get the actual changeset IDs the old way
+        let changeset_ids = self.get_changeset_ids(revision_id).await;
+        
+        if changeset_ids.is_empty() {
+            return None;
+        }
+
         // Get CSRF token first
         let csrf_token = self.get_csrf_token(revision_id).await.unwrap_or_else(|| "dummy".to_string());
 
@@ -233,16 +720,37 @@ impl PhabricatorCommentExtractor {
             ("Sec-Fetch-Site", "same-origin"),
         ];
 
-        // Use a default ref for now
+        // Try each changeset ID until we find one with suggestions
+        for changeset_id in changeset_ids {
+            // Try to get changeset data for each specific file that might contain suggestions
+            let result = self.try_fetch_specific_changeset(&changeset_url, &headers, &changeset_id).await;
+            if result.is_some() {
+                return result;
+            }
+            
+            // Note: The proper solution would be to extract ref values from the HTML page
+            // but this requires session authentication (cookies), not API tokens.
+            // For now, we limit our attempts to the API-provided changeset IDs.
+        }
+        
+        // If no specific changeset worked, try to find file-specific changesets
+        if let Some(result) = self.try_fetch_file_specific_changeset(revision_id, &changeset_url, &headers).await {
+            return Some(result);
+        }
+
+        None
+    }
+
+    async fn try_fetch_specific_changeset(&self, changeset_url: &str, headers: &[(&str, &str); 12], changeset_id: &str) -> Option<String> {
         let form_data = [
-            ("ref", "10924361^"),
+            ("ref", changeset_id),
             ("device", "2up"),
             ("__wflow__", "true"),
             ("__ajax__", "true"),
             ("__metablock__", "2"),
         ];
 
-        let mut request = self.client.post(&changeset_url);
+        let mut request = self.client.post(changeset_url);
         for (key, value) in headers.iter() {
             request = request.header(*key, *value);
         }
@@ -250,15 +758,98 @@ impl PhabricatorCommentExtractor {
         match request.form(&form_data).send().await {
             Ok(response) => {
                 match response.text().await {
-                    Ok(text) => Some(text),
-                    Err(_) => None
+                    Ok(text) => {
+                        
+                        // Check if this response contains suggestions or meaningful diff content
+                        if text.contains("inline-suggestion-view") 
+                            || text.contains("suggestionText")
+                            || (text.len() > 1000 && text.contains("differential-diff")) {
+                            return Some(text);
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
-            Err(_) => None
+            Err(_) => {}
         }
+        None
+    }
+
+    async fn try_fetch_file_specific_changeset(&self, revision_id: u32, changeset_url: &str, headers: &[(&str, &str); 12]) -> Option<String> {
+        // Try some variations of changeset IDs
+        let potential_refs = vec![
+            format!("{}", revision_id),
+            format!("{}", revision_id + 1),
+            format!("{}", revision_id + 2),
+            format!("{}", revision_id - 1),
+            format!("{}", revision_id - 2),
+        ];
+
+        for ref_id in potential_refs {
+            let form_data = [
+                ("ref", ref_id.as_str()),
+                ("device", "2up"),
+                ("__wflow__", "true"),
+                ("__ajax__", "true"),
+                ("__metablock__", "2"),
+            ];
+
+            let mut request = self.client.post(changeset_url);
+            for (key, value) in headers.iter() {
+                request = request.header(*key, *value);
+            }
+            
+            match request.form(&form_data).send().await {
+                Ok(response) => {
+                    match response.text().await {
+                        Ok(text) => {
+                            // Check for suggestions in general
+                            if text.contains("inline-suggestion-view") || text.contains("suggestionText") {
+                                return Some(text);
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        None
     }
 
     async fn parse_suggestions_from_ajax(&self, ajax_response: &str, line_number: u32, file_path: &str, include_done: bool) -> Option<String> {
+        // First try to extract inline suggestion content directly from HTML (shows proper diff)
+        if ajax_response.contains("inline-suggestion-view") {
+            // Parse the HTML and extract the suggestion content
+            let mut response = ajax_response;
+            if response.starts_with("for (;;);") {
+                response = &response[9..];
+            }
+            
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(response) {
+                if let Some(payload) = data.get("payload") {
+                    if let Some(changeset_html) = payload.get("changeset") {
+                        if let Some(html_str) = changeset_html.as_str() {
+                            // Extract suggestion from the inline-suggestion-view
+                            if let Some(suggestion) = self.extract_inline_suggestion(html_str) {
+                                return Some(suggestion);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback: try to extract suggestions from JSON format (may only show final state)
+        if let Some(suggestion) = self.extract_suggestion_from_json(ajax_response) {
+            return Some(suggestion);
+        }
+        
+        // Try to extract diff content from the changeset
+        if let Some(diff_content) = self.extract_diff_from_changeset(ajax_response) {
+            return Some(format!("**Code changes:**\n\n```diff\n{}\n```", diff_content));
+        }
+        
         let mut response = ajax_response;
         
         // The AJAX response starts with for (;;); followed by JSON
@@ -289,12 +880,91 @@ impl PhabricatorCommentExtractor {
         None
     }
 
-    async fn find_suggestions_in_html(&self, document: &Html, line_number: u32, _file_path: &str, include_done: bool) -> Option<String> {
+    fn extract_suggestion_from_json(&self, json_response: &str) -> Option<String> {
+        
+        // Strip the "for (;;);" prefix that Phabricator adds for security
+        let clean_json = if json_response.starts_with("for (;;);") {
+            &json_response[9..]
+        } else {
+            json_response
+        };
+        
+        // Parse the JSON response to extract suggestionText
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean_json) {
+            // Look for suggestionText in the JSON structure
+            if let Some(suggestion_text) = self.find_suggestion_text_recursive(&json) {
+                if !suggestion_text.trim().is_empty() {
+                    return Some(format!("**Suggested changes:**\n\n```diff\n{}\n```", suggestion_text.trim()));
+                }
+            }
+        } else {
+        }
+        
+        // Fallback: try to extract suggestionText using regex that handles escaped content
+        let re = regex::Regex::new(r#""suggestionText":"((?:[^"\\]|\\.)*)""#).unwrap();
+        if let Some(captures) = re.captures(json_response) {
+            if let Some(suggestion_match) = captures.get(1) {
+                let suggestion_text = suggestion_match.as_str()
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\u003e", ">")
+                    .replace("\\u003c", "<")
+                    .replace("\\/", "/")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
+                    
+                if !suggestion_text.trim().is_empty() {
+                    return Some(format!("**Suggested changes:**\n\n```diff\n{}\n```", suggestion_text.trim()));
+                }
+            }
+        } else {
+        }
+        
+        None
+    }
+    
+    fn find_suggestion_text_recursive(&self, value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                // Check if this object has suggestionText
+                if let Some(suggestion_text) = map.get("suggestionText") {
+                    if let Some(text) = suggestion_text.as_str() {
+                        if !text.trim().is_empty() {
+                            // Look for suggestions that contain actual changes
+                            if text.contains("uuuu") || text.contains("-") || text.contains("+") {
+                                return Some(text.to_string());
+                            }
+                        }
+                    }
+                }
+                
+                // Recursively search in all object values
+                for (_key, val) in map {
+                    if let Some(result) = self.find_suggestion_text_recursive(val) {
+                        return Some(result);
+                    }
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                // Recursively search in all array elements
+                for val in arr {
+                    if let Some(result) = self.find_suggestion_text_recursive(val) {
+                        return Some(result);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    async fn find_suggestions_in_html(&self, document: &Html, _line_number: u32, _file_path: &str, include_done: bool) -> Option<String> {
         // Look for inline-suggestion-view elements
         if let Ok(suggestion_selector) = Selector::parse(".inline-suggestion-view") {
             let suggestions: Vec<_> = document.select(&suggestion_selector).collect();
             
-            for (i, suggestion) in suggestions.iter().enumerate() {
+            // Extract suggestions from available suggestion elements
+            for suggestion in suggestions.iter() {
                 // Check if this suggestion is marked as "done"
                 let is_done = self.is_suggestion_done(suggestion);
                 if is_done && !include_done {
@@ -303,18 +973,118 @@ impl PhabricatorCommentExtractor {
                 
                 // Extract the suggestion content from the table structure
                 if let Some(suggestion_text) = self.extract_suggestion_from_table(suggestion) {
-                    // Simple heuristic: if this is the first iteration and we have line 38, or second iteration and line 100
-                    // (since we know there are 2 suggestions from the Python output)
-                    if (line_number == 38 && i == 0) || (line_number == 100 && i == 1) {
-                        let prefix = if is_done { "**[DONE] Suggested changes:**" } else { "**Suggested changes:**" };
-                        return Some(format!("{}\n\n```diff\n{}\n```", prefix, suggestion_text));
-                    }
+                    return Some(suggestion_text);
                 }
             }
         }
 
+
         None
     }
+
+    fn extract_diff_from_changeset(&self, ajax_response: &str) -> Option<String> {
+        let mut response = ajax_response;
+        
+        // Remove the for (;;); prefix if present
+        if response.starts_with("for (;;);") {
+            response = &response[9..];
+        }
+
+        // Parse JSON response
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(response) {
+            if let Some(payload) = data.get("payload") {
+                if let Some(changeset_html) = payload.get("changeset") {
+                    if let Some(html_str) = changeset_html.as_str() {
+                        // Parse HTML and extract diff content
+                        let document = Html::parse_document(html_str);
+                        
+                        // Look for diff rows that show changes
+                        if let Ok(diff_selector) = Selector::parse("tr") {
+                            let mut diff_lines = Vec::new();
+                            
+                            for row in document.select(&diff_selector) {
+                                // Look for cells with old (removed) content
+                                if let Ok(old_selector) = Selector::parse("td.old") {
+                                    if let Some(old_cell) = row.select(&old_selector).next() {
+                                        let text = old_cell.text().collect::<String>().trim().to_string();
+                                        if !text.is_empty() {
+                                            diff_lines.push(format!("- {}", text));
+                                        }
+                                    }
+                                }
+                                
+                                // Look for cells with new (added) content
+                                if let Ok(new_selector) = Selector::parse("td.new") {
+                                    if let Some(new_cell) = row.select(&new_selector).next() {
+                                        let text = new_cell.text().collect::<String>().trim().to_string();
+                                        if !text.is_empty() {
+                                            diff_lines.push(format!("+ {}", text));
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if !diff_lines.is_empty() {
+                                return Some(diff_lines.join("\n"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+
+    /// Extracts suggestion diff content from HTML table showing old/new lines
+    fn extract_inline_suggestion(&self, html: &str) -> Option<String> {
+        // Look for inline-suggestion-view content
+        if let Some(start) = html.find("inline-suggestion-view") {
+            // Find the table containing the suggestion
+            let search_area = &html[start..];
+            if let Some(table_start) = search_area.find("<table") {
+                if let Some(table_end) = search_area.find("</table>") {
+                    let table_html = &search_area[table_start..table_end + 8];
+                    
+                    // Parse the table to extract old and new lines
+                    let document = Html::parse_document(table_html);
+                    let mut diff_lines = Vec::new();
+                    
+                    if let Ok(row_selector) = Selector::parse("tr") {
+                        for row in document.select(&row_selector) {
+                            let row_html = row.html();
+                            let row_text = row.text().collect::<String>();
+                            
+                            // Look for old lines (removed) - check for "left old" class
+                            if row_html.contains("left old") {
+                                // Extract text and clean it up
+                                let cleaned = row_text.trim().trim_start_matches("- ").trim();
+                                if !cleaned.is_empty() && !cleaned.contains("break;") && !cleaned.contains("}") {
+                                    diff_lines.push(format!("- {}", cleaned));
+                                }
+                            }
+                            
+                            // Look for new lines (added) - check for "right new" class  
+                            if row_html.contains("right new") {
+                                // Extract text and clean it up
+                                let cleaned = row_text.trim().trim_start_matches("+ ").trim();
+                                if !cleaned.is_empty() && !cleaned.contains("break;") && !cleaned.contains("}") {
+                                    diff_lines.push(format!("+ {}", cleaned));
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !diff_lines.is_empty() {
+                        return Some(diff_lines.join("\n"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    
 
     fn is_suggestion_done(&self, suggestion_element: &scraper::ElementRef) -> bool {
         // Look for parent inline comment that has "inline-is-done" class
@@ -331,19 +1101,18 @@ impl PhabricatorCommentExtractor {
     }
 
     fn extract_suggestion_from_table(&self, suggestion_element: &scraper::ElementRef) -> Option<String> {
-        // Find the table within the suggestion element
+        let mut diff_lines = Vec::new();
+        
+        // Strategy 1: Try to find table with diff content
         if let Ok(table_selector) = Selector::parse("table") {
             if let Some(table) = suggestion_element.select(&table_selector).next() {
-                let mut diff_lines = Vec::new();
-                
                 if let Ok(row_selector) = Selector::parse("tr") {
                     for row in table.select(&row_selector) {
                         // Look for old lines (removed)
-                        if let Ok(old_selector) = Selector::parse("td.left.old") {
+                        if let Ok(old_selector) = Selector::parse("td.left.old, td.old, .diff-old") {
                             if let Some(old_cell) = row.select(&old_selector).next() {
                                 let text = old_cell.text().collect::<String>().trim().to_string();
                                 if !text.is_empty() && text != "-" {
-                                    // Clean the text by removing aural markers
                                     let cleaned = text.trim_start_matches("- ").trim();
                                     if !cleaned.is_empty() {
                                         diff_lines.push(format!("- {}", cleaned));
@@ -353,11 +1122,10 @@ impl PhabricatorCommentExtractor {
                         }
 
                         // Look for new lines (added)
-                        if let Ok(new_selector) = Selector::parse("td.right.new") {
+                        if let Ok(new_selector) = Selector::parse("td.right.new, td.new, .diff-new") {
                             if let Some(new_cell) = row.select(&new_selector).next() {
                                 let text = new_cell.text().collect::<String>().trim().to_string();
                                 if !text.is_empty() && text != "+" {
-                                    // Clean the text by removing aural markers
                                     let cleaned = text.trim_start_matches("+ ").trim();
                                     if !cleaned.is_empty() {
                                         diff_lines.push(format!("+ {}", cleaned));
@@ -367,15 +1135,22 @@ impl PhabricatorCommentExtractor {
                         }
                     }
                 }
-
-                if !diff_lines.is_empty() {
-                    return Some(diff_lines.join("\n"));
-                }
             }
         }
 
-        None
+
+        if !diff_lines.is_empty() {
+            Some(diff_lines.join("\n"))
+        } else {
+            None
+        }
     }
+
+    
+
+
+
+
 
     async fn get_csrf_token(&self, revision_id: u32) -> Option<String> {
         let review_url = format!("{}/D{}", self.base_url, revision_id);
@@ -603,10 +1378,10 @@ impl PhabricatorCommentExtractor {
                                 if let Some(suggestion) = self.fetch_suggestion_from_web(self.current_revision_id.unwrap_or(0), line_number, file_path, include_done).await {
                                     content = suggestion;
                                 } else {
-                                    content = "*[Empty inline comment - may be a code suggestion]*".to_string();
+                                    content = "*[Empty inline comment - likely contains a code suggestion that cannot be extracted via API]*".to_string();
                                 }
                             } else {
-                                content = "*[Empty inline comment - may be a code suggestion]*".to_string();
+                                content = "*[Empty inline comment - likely contains a code suggestion that cannot be extracted via API]*".to_string();
                             }
                         }
 

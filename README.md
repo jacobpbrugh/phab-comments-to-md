@@ -1,6 +1,6 @@
 # phab-comments-to-md
 
-Extract Phabricator review comments and format them as Markdown for further analysis by LLM agents.
+Extract Phabricator review comments and format them as Markdown for further analysis by LLM agents. The tool automatically extracts both regular comments and JavaScript-rendered inline code suggestions by using your Firefox browser cookies for authentication.
 
 ## Installation
 
@@ -30,6 +30,29 @@ cargo build --release
 ./target/release/phab-comments-to-md --diff-id 12345 --token your-api-token --include-done
 ```
 
+### Authentication
+
+The tool requires both API token and browser cookies for full functionality:
+
+1. **API Token**: Required for basic comment extraction via Phabricator API
+2. **Firefox Cookies**: Automatically extracted for JavaScript-rendered inline suggestions
+
+#### Firefox Cookie Authentication
+
+The tool automatically finds and uses cookies from your most recent Firefox profile that has logged into Phabricator. It:
+- Detects Firefox profiles across Windows, macOS, and Linux
+- Selects the most recently modified profile with valid Phabricator cookies
+- Handles cases where Firefox is running (database locked) by creating temporary copies
+- Falls back to environment variable if Firefox cookies aren't available
+
+#### Manual Cookie Override
+
+If automatic Firefox cookie detection doesn't work, set cookies manually:
+
+```bash
+export PHABRICATOR_COOKIES="phsid=your-session-id; phusr=your-username"
+```
+
 ### Environment Variables
 
 Set environment variables to simplify usage:
@@ -41,6 +64,9 @@ export PHABRICATOR_BASE_URL=https://phabricator.example.com
 
 # For Mozilla's Phabricator, only token is needed (base URL defaults to Mozilla's)
 export PHABRICATOR_TOKEN=your-api-token
+
+# Optional: Manual cookie override (if Firefox auto-detection fails)
+export PHABRICATOR_COOKIES="phsid=your-session-id; phusr=your-username"
 
 # Now you can use just the diff ID
 ./target/release/phab-comments-to-md --diff-id 12345
@@ -70,14 +96,36 @@ Options:
 **Environment Variables:**
 - `PHABRICATOR_TOKEN` - API token (avoids passing token on command line)
 - `PHABRICATOR_BASE_URL` - Base URL (for non-Mozilla Phabricator instances)
+- `PHABRICATOR_COOKIES` - Manual cookie override (format: "phsid=id; phusr=user")
 
 You must provide either `--url` OR `--diff-id`. When using `--diff-id`, the base URL defaults to Mozilla's Phabricator.
+
+## Features
+
+### Comment Extraction
+- **Regular comments**: Extracted via Phabricator API using your API token
+- **Inline code suggestions**: JavaScript-rendered suggestions extracted using browser cookies
+- **Both diff formats**: Shows both removed (-) and added (+) lines in suggestions
+- **Generic extraction**: Works with any Phabricator review without hardcoding
+
+### Authentication
+- **Automatic Firefox cookie detection**: Finds your most recent Firefox profile automatically
+- **Cross-platform support**: Works on Windows, macOS, and Linux
+- **Database lock handling**: Gracefully handles Firefox running by creating temporary database copies
+- **Manual override**: Fallback to manual cookie specification if needed
+
+### Output Options
+- **Done comment filtering**: Excludes resolved comments by default for cleaner LLM input
+- **Include done flag**: Use `--include-done` to show resolved comments with [DONE] markers
+- **File output**: Save to file or output to stdout
+- **Chronological sorting**: Comments sorted by timestamp for natural reading flow
 
 ## Output Format
 
 The tool generates Markdown with:
 - General comments sorted chronologically
 - Inline comments grouped by file and sorted chronologically
+- Code suggestions showing both old and new lines in diff format
 
 Comments marked as "done" are automatically filtered out to focus on active
 discussion. Use `--include-done` to include them with clear [DONE] markers for
