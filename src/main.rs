@@ -220,6 +220,7 @@ impl PhabricatorCommentExtractor {
         }
     }
 
+
     async fn extract_firefox_cookies(&self, domain: &str) -> Result<HashMap<String, String>> {
         // Try environment variable first for manual cookie specification
         if let Ok(cookie_env) = std::env::var("PHABRICATOR_COOKIES") {
@@ -449,6 +450,7 @@ impl PhabricatorCommentExtractor {
 
     /// Fetches JavaScript-rendered suggestions from Phabricator web interface
     /// using authenticated AJAX requests with extracted ref parameters
+    /// Requires gzip decompression for some Phabricator instances
     async fn fetch_suggestion_from_web(
         &self,
         revision_id: u32,
@@ -724,7 +726,9 @@ impl PhabricatorCommentExtractor {
 
             match request.form(&form_data).send().await {
                 Ok(response) => {
+                    // Capture response details before consuming the response
                     if let Ok(text) = response.text().await {
+
                         // Check if this response contains suggestions and score it
                         let has_suggestion_text = text.contains("suggestionText");
                         let has_inline_view = text.contains("inline-suggestion-view");
@@ -818,7 +822,7 @@ impl PhabricatorCommentExtractor {
             }
 
             // Note: The proper solution would be to extract ref values from the HTML page
-            // but this requires session authentication (cookies), not API tokens.
+            // but this requires session authentication (cookies) and gzip decompression, not just API tokens.
             // For now, we limit our attempts to the API-provided changeset IDs.
         }
 
@@ -852,10 +856,13 @@ impl PhabricatorCommentExtractor {
             request = request.header(*key, *value);
         }
 
+
         match request.form(&form_data).send().await {
             Ok(response) => {
+                // Capture response details before consuming the response
                 match response.text().await {
                     Ok(text) => {
+
                         // Check if this response contains suggestions or meaningful diff content
                         if text.contains("inline-suggestion-view")
                             || text.contains("suggestionText")
@@ -903,8 +910,10 @@ impl PhabricatorCommentExtractor {
 
             match request.form(&form_data).send().await {
                 Ok(response) => {
+                    // Capture response details before consuming the response
                     match response.text().await {
                         Ok(text) => {
+
                             // Check for suggestions in general
                             if text.contains("inline-suggestion-view")
                                 || text.contains("suggestionText")
@@ -943,7 +952,7 @@ impl PhabricatorCommentExtractor {
                             // Extract suggestion from the inline-suggestion-view
                             debug!("Extracting inline suggestion from HTML");
                             if let Some(suggestion) = self.extract_inline_suggestion(html_str) {
-                                info!("Successfully extracted inline suggestion");
+                                debug!("Successfully extracted inline suggestion");
                                 return Some(suggestion);
                             }
                         }
@@ -955,7 +964,7 @@ impl PhabricatorCommentExtractor {
         // Fallback: try to extract suggestions from JSON format (may only show final state)
         debug!("Attempting to extract suggestion from JSON format");
         if let Some(suggestion) = self.extract_suggestion_from_json(ajax_response) {
-            info!("Successfully extracted suggestion from JSON");
+            debug!("Successfully extracted suggestion from JSON");
             return Some(suggestion);
         }
 
@@ -1317,6 +1326,7 @@ impl PhabricatorCommentExtractor {
         }
     }
 
+
     async fn get_csrf_token(&self, revision_id: u32) -> Option<String> {
         let review_url = format!("{}/D{}", self.base_url, revision_id);
 
@@ -1414,7 +1424,7 @@ impl PhabricatorCommentExtractor {
             ("constraints[ids][0]", &diff_id.to_string()),
         ];
 
-        info!(
+        debug!(
             "Fetching revision PHID for diff_id={} from: {}",
             diff_id, url
         );
@@ -1429,7 +1439,7 @@ impl PhabricatorCommentExtractor {
             .context(format!("Failed to send request to {}", url))?;
 
         let status = response.status();
-        info!("Response status: {}", status);
+        debug!("Response status: {}", status);
 
         if !status.is_success() {
             let error_text = response
@@ -1509,7 +1519,7 @@ impl PhabricatorCommentExtractor {
             ("objectIdentifier", object_phid),
         ];
 
-        info!(
+        debug!(
             "Fetching transactions for object_phid={} from: {}",
             object_phid, url
         );
@@ -1524,7 +1534,7 @@ impl PhabricatorCommentExtractor {
             .context(format!("Failed to send request to {}", url))?;
 
         let status = response.status();
-        info!("Response status: {}", status);
+        debug!("Response status: {}", status);
 
         if !status.is_success() {
             let error_text = response
@@ -1929,12 +1939,12 @@ async fn main() -> Result<()> {
 
     // Determine diff ID and base URL
     let (diff_id, base_url) = if let Some(url) = args.url {
-        info!("Processing URL: {}", url);
+        debug!("Processing URL: {}", url);
         let extractor = PhabricatorCommentExtractor::new(String::new(), token.clone());
         let diff_id = extractor
             .extract_diff_id_from_url(&url)
             .context("Could not extract diff ID from URL")?;
-        info!("Extracted diff_id: {}", diff_id);
+        debug!("Extracted diff_id: {}", diff_id);
 
         // Extract base URL from the provided URL
         let parsed_url = Url::parse(&url)?;
@@ -1961,7 +1971,7 @@ async fn main() -> Result<()> {
     };
 
     // Create extractor and process
-    info!("Creating extractor with base_url: {}", base_url);
+    debug!("Creating extractor with base_url: {}", base_url);
     let mut extractor = PhabricatorCommentExtractor::new(base_url, token);
 
     info!(
