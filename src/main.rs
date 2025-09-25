@@ -61,6 +61,13 @@ struct Args {
         help = "Include comments marked as 'done' (useful for LLM verification of addressed feedback)"
     )]
     include_done: bool,
+
+    /// Dump raw web payloads to ./_phab_debug for debugging
+    #[arg(
+        long,
+        help = "Dump raw web payloads (AJAX/HTML/JSON) to ./_phab_debug for debugging"
+    )]
+    dump_web: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,11 +206,15 @@ struct PhabricatorCommentExtractor {
     client: Client,
     user_cache: HashMap<String, String>,
     current_revision_id: Option<u32>,
+    // Cache mapping for faster ref selection per comment/file
+    ref_cache_by_comment: HashMap<String, String>,
+    ref_cache_by_path: HashMap<String, String>,
+    dump_web: bool,
 }
 
 #[allow(dead_code)]
 impl PhabricatorCommentExtractor {
-    fn new(base_url: String, api_token: String) -> Self {
+    fn new(base_url: String, api_token: String, dump_web: bool) -> Self {
         let client = Client::builder()
             .user_agent(
                 "phab-comments-to-md/0.1.0 (https://github.com/padenot/phab-comments-to-md)",
@@ -217,6 +228,23 @@ impl PhabricatorCommentExtractor {
             client,
             user_cache: HashMap::new(),
             current_revision_id: None,
+            ref_cache_by_comment: HashMap::new(),
+            ref_cache_by_path: HashMap::new(),
+            dump_web,
+        }
+    }
+
+    fn maybe_dump(&self, filename: &str, content: &str) {
+        if !self.dump_web { return; }
+        let dir = std::path::Path::new("./_phab_debug");
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            debug!("dump: mkdir failed: {}", e);
+            return;
+        }
+        let sanitized = filename.replace('/', "_");
+        let path = dir.join(sanitized);
+        if let Err(e) = std::fs::write(&path, content) {
+            debug!("dump: write failed: {}", e);
         }
     }
 
@@ -452,21 +480,125 @@ impl PhabricatorCommentExtractor {
     /// using authenticated AJAX requests with extracted ref parameters
     /// Requires gzip decompression for some Phabricator instances
     async fn fetch_suggestion_from_web(
-        &self,
+        &mut self,
         revision_id: u32,
         line_number: u32,
+        line_length: u32,
         file_path: &str,
         include_done: bool,
+        comment_id: &str,
     ) -> Option<String> {
-        if let Some(changeset_data) = self.fetch_changeset_data(revision_id).await {
+        // Prefer fetching the changeset response that contains this comment's anchor
+        if let Some(changeset_data) = self
+            .fetch_changeset_data_for_comment(revision_id, file_path, comment_id, include_done)
+            .await
+        {
+            if let Some(s) = self.extract_suggestion_for_comment_id_from_ajax(&changeset_data, comment_id, include_done) {
+                return Some(s);
+            }
+        }
+        // Fallback to general changeset fetching + heuristics
+        if let Some(changeset_data) = self
+            .fetch_changeset_data(revision_id, Some(line_number), include_done)
+            .await
+        {
+            if let Some(s) = self.extract_suggestion_for_comment_id_from_ajax(&changeset_data, comment_id, include_done) {
+                return Some(s);
+            }
             if let Some(suggestions) = self
-                .parse_suggestions_from_ajax(&changeset_data, line_number, file_path, include_done)
+                .parse_suggestions_from_ajax(&changeset_data, line_number, line_length, file_path, include_done)
                 .await
             {
                 return Some(suggestions);
             }
         }
         None
+    }
+
+    async fn fetch_changeset_data_for_comment(
+        &mut self,
+        revision_id: u32,
+        file_path: &str,
+        comment_id: &str,
+        _include_done: bool,
+    ) -> Option<String> {
+        // Check cache first
+        if let Some(cached_ref) = self.ref_cache_by_comment.get(comment_id) {
+            if let Some(text) = self.post_changeset_and_get_text(revision_id, cached_ref).await {
+                // Verify it still contains the anchor
+                if self.changeset_contains_inline_anchor(&text, comment_id) {
+                    return Some(text);
+                }
+            }
+        }
+
+        // Extract ref parameters from the revision page
+        let ref_params = self.extract_ref_parameters_from_page(revision_id).await;
+        if ref_params.is_empty() { return None; }
+
+        // Try each ref and pick the one that contains this comment's inline anchor
+        for r in &ref_params {
+            if let Some(text) = self.post_changeset_and_get_text(revision_id, r).await {
+                // Dump minimal diagnostics
+                self.maybe_dump(&format!("changeset_ref_{}_anchorcheck_inline{}.json", r, comment_id), &text);
+                if self.changeset_contains_inline_anchor(&text, comment_id) {
+                    // Cache by comment and optionally by path
+                    let _ = self.ref_cache_by_comment.insert(comment_id.to_string(), r.clone());
+                    let _ = self.ref_cache_by_path.insert(file_path.to_string(), r.clone());
+                    return Some(text);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn changeset_contains_inline_anchor(&self, ajax_text: &str, comment_id: &str) -> bool {
+        let mut s = ajax_text;
+        if s.starts_with("for (;;);") { s = &s[9..]; }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Some(payload) = json.get("payload") {
+                if let Some(changeset_html) = payload.get("changeset") {
+                    if let Some(h) = changeset_html.as_str() {
+                        let cid = comment_id.trim_matches('"');
+                        let anchor_id = format!("id=\"inline-{}\"", cid);
+                        let anchor_name = format!("name=\"inline-{}\"", cid);
+                        let cell_anchor = format!("id=\"anchor-inline-{}\"", cid);
+                        return h.contains(&anchor_id) || h.contains(&anchor_name) || h.contains(&cell_anchor);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    async fn post_changeset_and_get_text(&self, revision_id: u32, ref_param: &str) -> Option<String> {
+        // Get domain + CSRF (requires cookies)
+        let domain = if let Ok(parsed_url) = Url::parse(&self.base_url) {
+            parsed_url.host_str().unwrap_or("phabricator.services.mozilla.com").to_string()
+        } else { "phabricator.services.mozilla.com".to_string() };
+        let csrf_token = self.get_csrf_token_with_cookies(revision_id, &domain).await.unwrap_or_else(|| "dummy".to_string());
+
+        let changeset_url = format!("{}/differential/changeset/", self.base_url);
+        let headers = [
+            ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0"),
+            ("Accept", "*/*"),
+            ("Accept-Language", "en-US,en;q=0.5"),
+            ("Accept-Encoding", "gzip, deflate, br"),
+            ("X-Phabricator-Csrf", &csrf_token),
+            ("X-Phabricator-Via", &format!("/D{}", revision_id)),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Origin", &self.base_url),
+            ("Connection", "keep-alive"),
+            ("Sec-Fetch-Dest", "empty"),
+            ("Sec-Fetch-Mode", "cors"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ];
+        let form_data = [("ref", ref_param), ("device", "2up"), ("__wflow__", "true"), ("__ajax__", "true"), ("__metablock__", "2")];
+
+        let mut request = self.client.post(&changeset_url);
+        for (k, v) in headers.iter() { request = request.header(*k, *v); }
+        match request.form(&form_data).send().await { Ok(resp) => match resp.text().await { Ok(t) => Some(t), Err(_) => None }, Err(_) => None }
     }
 
     async fn get_changeset_ids(&self, revision_id: u32) -> Vec<String> {
@@ -641,6 +773,7 @@ impl PhabricatorCommentExtractor {
                         }
                     }
 
+                    debug!("found {} ref ids on revision page", refs.len());
                     refs
                 } else {
                     Vec::new()
@@ -654,6 +787,8 @@ impl PhabricatorCommentExtractor {
         &self,
         revision_id: u32,
         ref_params: &[String],
+        target_line: Option<u32>,
+        _include_done: bool,
     ) -> Option<String> {
         // Get domain for Firefox cookies
         let domain = if let Ok(parsed_url) = Url::parse(&self.base_url) {
@@ -693,8 +828,8 @@ impl PhabricatorCommentExtractor {
         ];
 
         // Try each ref parameter and prioritize those with suggestionText
-        let mut best_response = None;
-        let mut best_score = 0;
+        let mut best_response: Option<String> = None;
+        let mut best_score: i64 = -1; // higher is better in this scheme
 
         for ref_param in ref_params {
             let form_data = [
@@ -728,22 +863,61 @@ impl PhabricatorCommentExtractor {
                 Ok(response) => {
                     // Capture response details before consuming the response
                     if let Ok(text) = response.text().await {
-
-                        // Check if this response contains suggestions and score it
+                        // dump and log characteristics
                         let has_suggestion_text = text.contains("suggestionText");
-                        let has_inline_view = text.contains("inline-suggestion-view");
-                        let has_inline_comment = text.contains("differential-inline-comment");
+                        let has_inline_view   = text.contains("inline-suggestion-view");
+                        let has_inline_comment= text.contains("differential-inline-comment");
+                        self.maybe_dump(&format!("changeset_ref_{}_sug{}_view{}_inline{}.json",
+                            ref_param, has_suggestion_text as u8, has_inline_view as u8, has_inline_comment as u8), &text);
+                        debug!("ref {}: suggestion_text={} inline_view={} inline_comment={}",
+                               ref_param, has_suggestion_text, has_inline_view, has_inline_comment);
 
-                        // Score responses: suggestionText > inline-suggestion-view > differential-inline-comment
-                        let mut score = 0;
-                        if has_suggestion_text {
-                            score += 100;
-                        }
-                        if has_inline_view {
-                            score += 10;
-                        }
-                        if has_inline_comment {
-                            score += 1;
+                        // Prefer responses whose nearest suggestion is closer to target_line
+                        let mut score: i64 = 0;
+                        if has_suggestion_text { score += 100; }
+                        if has_inline_view { score += 10; }
+                        if has_inline_comment { score += 1; }
+
+                        if let Some(tline) = target_line {
+                            // Try to compute distance to nearest inline suggestion anchor
+                            let mut response_html_opt: Option<String> = None;
+                            let mut s = text.as_str();
+                            if s.starts_with("for (;;);") { s = &s[9..]; }
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
+                                if let Some(payload) = json.get("payload") {
+                                    if let Some(changeset_html) = payload.get("changeset") {
+                                        if let Some(h) = changeset_html.as_str() {
+                                            response_html_opt = Some(h.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(html) = response_html_opt {
+                                // Extract candidates and compute nearest distance
+                                let mut best_dist: i64 = i64::MAX;
+                                let mut idx = 0usize;
+                                let anchor_re = regex::Regex::new(r"C\d{7,8}[ON]L(\d+)").ok();
+                                while let Some(pos) = html[idx..].find("inline-suggestion-view") {
+                                    let abs_pos = idx + pos;
+                                    // search backward for closest anchor
+                                    let back_start = abs_pos.saturating_sub(8000);
+                                    if let Some(re) = &anchor_re {
+                                        let back_slice = &html[back_start..abs_pos];
+                                        let mut last_line: Option<u32> = None;
+                                        for cap in re.captures_iter(back_slice) {
+                                            if let Some(m) = cap.get(1) {
+                                                if let Ok(n) = m.as_str().parse::<u32>() { last_line = Some(n); }
+                                            }
+                                        }
+                                        if let Some(n) = last_line {
+                                            let d = (n as i64 - tline as i64).abs();
+                                            if d < best_dist { best_dist = d; }
+                                        }
+                                    }
+                                    idx = abs_pos + 1;
+                                }
+                                if best_dist != i64::MAX { score += 1_000_000 - best_dist; }
+                            }
                         }
 
                         if score > best_score {
@@ -763,14 +937,14 @@ impl PhabricatorCommentExtractor {
         None
     }
 
-    async fn fetch_changeset_data(&self, revision_id: u32) -> Option<String> {
+    async fn fetch_changeset_data(&self, revision_id: u32, target_line: Option<u32>, include_done: bool) -> Option<String> {
         // First try to extract ref parameters from the initial page
         let ref_params = self.extract_ref_parameters_from_page(revision_id).await;
 
         if !ref_params.is_empty() {
             // Use the extracted ref parameters directly
             if let Some(result) = self
-                .fetch_changeset_with_refs(revision_id, &ref_params)
+                .fetch_changeset_with_refs(revision_id, &ref_params, target_line, include_done)
                 .await
             {
                 return Some(result);
@@ -862,6 +1036,7 @@ impl PhabricatorCommentExtractor {
                 // Capture response details before consuming the response
                 match response.text().await {
                     Ok(text) => {
+                        self.maybe_dump(&format!("changeset_try_specific_{}.json", changeset_id), &text);
 
                         // Check if this response contains suggestions or meaningful diff content
                         if text.contains("inline-suggestion-view")
@@ -913,6 +1088,7 @@ impl PhabricatorCommentExtractor {
                     // Capture response details before consuming the response
                     match response.text().await {
                         Ok(text) => {
+                            self.maybe_dump(&format!("changeset_try_file_specific_{}.json", ref_id), &text);
 
                             // Check for suggestions in general
                             if text.contains("inline-suggestion-view")
@@ -934,10 +1110,12 @@ impl PhabricatorCommentExtractor {
         &self,
         ajax_response: &str,
         line_number: u32,
+        line_length: u32,
         file_path: &str,
         include_done: bool,
     ) -> Option<String> {
-        // First try to extract inline suggestion content directly from HTML (shows proper diff)
+        debug!("matching suggestion for file '{}' around line {} (len {})", file_path, line_number, line_length);
+        // Prefer extracting inline suggestion content from HTML first (ties to the correct inline comment)
         if ajax_response.contains("inline-suggestion-view") {
             // Parse the HTML and extract the suggestion content
             let mut response = ajax_response;
@@ -949,10 +1127,9 @@ impl PhabricatorCommentExtractor {
                 if let Some(payload) = data.get("payload") {
                     if let Some(changeset_html) = payload.get("changeset") {
                         if let Some(html_str) = changeset_html.as_str() {
-                            // Extract suggestion from the inline-suggestion-view
-                            debug!("Extracting inline suggestion from HTML");
+                            // Extract the first inline-suggestion-view block (cell-specific parsing)
                             if let Some(suggestion) = self.extract_inline_suggestion(html_str) {
-                                debug!("Successfully extracted inline suggestion");
+                                debug!("fallback inline suggestion extracted from HTML (len={})", suggestion.len());
                                 return Some(suggestion);
                             }
                         }
@@ -961,9 +1138,17 @@ impl PhabricatorCommentExtractor {
             }
         }
 
-        // Fallback: try to extract suggestions from JSON format (may only show final state)
-        debug!("Attempting to extract suggestion from JSON format");
+        // Fallback: JSON suggestion mapped to the nearest line, if available
+        debug!("Attempting to extract suggestion from JSON format (nearest line)");
+        if let Some(suggestion) = self.extract_suggestion_from_json_for_line(ajax_response, line_number, line_length) {
+            debug!("json suggestion near line {} extracted (len={})", line_number, suggestion.len());
+            return Some(suggestion);
+        }
+
+        // Fallback: any JSON suggestion
+        debug!("Attempting to extract any suggestion from JSON format");
         if let Some(suggestion) = self.extract_suggestion_from_json(ajax_response) {
+            debug!("inline suggestion extracted from JSON (len={})", suggestion.len());
             debug!("Successfully extracted suggestion from JSON");
             return Some(suggestion);
         }
@@ -1016,6 +1201,89 @@ impl PhabricatorCommentExtractor {
 
         None
     }
+
+    fn extract_suggestion_for_comment_id_from_ajax(&self, ajax_response: &str, comment_id: &str, include_done: bool) -> Option<String> {
+        let mut response = ajax_response;
+        if response.starts_with("for (;;);") { response = &response[9..]; }
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(response) {
+            if let Some(payload) = data.get("payload") {
+                if let Some(changeset_html) = payload.get("changeset") {
+                    if let Some(html_str) = changeset_html.as_str() {
+                        return self.extract_suggestion_for_comment_id_in_html(html_str, comment_id, include_done);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_suggestion_for_comment_id_in_html(&self, html: &str, comment_id: &str, _include_done: bool) -> Option<String> {
+        // Find the anchor for this inline comment
+        let anchor = format!("id=\"inline-{}\"", comment_id.trim_matches('"'));
+        let name_anchor = format!("name=\"inline-{}\"", comment_id.trim_matches('"'));
+        let anchor_pos = html.find(&anchor).or_else(|| html.find(&name_anchor));
+        let anchor_pos = match anchor_pos { Some(p) => p, None => return None };
+
+        // Look forward for the inline comment container and a suggestion view
+        let search_area = &html[anchor_pos..std::cmp::min(anchor_pos + 40000, html.len())];
+        let div_rel = search_area.find("differential-inline-comment");
+        let div_rel = match div_rel { Some(r) => r, None => return None };
+        let block_area = &search_area[div_rel..];
+
+        // Do not filter DONE here; higher-level logic already filters inlines by is_done via API fields.
+
+        // Find suggestion table inside this block
+        if let Some(sugg_rel) = block_area.find("inline-suggestion-view") {
+            let sugg_area = &block_area[sugg_rel..];
+            if let Some(table_rel) = sugg_area.find("<table") {
+                let table_area = &sugg_area[table_rel..];
+                if let Some(end_rel) = table_area.find("</table>") {
+                    let table_html = &table_area[..end_rel + 8];
+
+                    // Build diff lines from this table using cell-specific extraction
+                    let document = Html::parse_document(table_html);
+                    let mut diff_lines = Vec::new();
+                    if let Ok(row_selector) = Selector::parse("tr") {
+                        for row in document.select(&row_selector) {
+                            // Removed lines (old side)
+                            if let Ok(old_sel) = Selector::parse("td.left.old, td.left.old.old-full, td.old, .diff-old") {
+                                if let Some(old_cell) = row.select(&old_sel).next() {
+                                    let mut s = old_cell.text().collect::<String>().replace('\u{00A0}', " ");
+                                    s = s.replace('\r', "");
+                                    s = s.replace('\n', "");
+                                    // Strip leading aural markers only; preserve indentation
+                                    while s.starts_with("- ") { s = s[2..].to_string(); }
+                                    if !s.trim().is_empty() && s != "-" {
+                                        diff_lines.push(format!("- {}", s));
+                                    }
+                                }
+                            }
+                            // Added lines (new side)
+                            if let Ok(new_sel) = Selector::parse("td.right.new, td.right.new.new-full, td.new, .diff-new") {
+                                if let Some(new_cell) = row.select(&new_sel).next() {
+                                    let mut s = new_cell.text().collect::<String>().replace('\u{00A0}', " ");
+                                    s = s.replace('\r', "");
+                                    s = s.replace('\n', "");
+                                    // Strip leading aural markers only; preserve indentation
+                                    while s.starts_with("+ ") { s = s[2..].to_string(); }
+                                    if !s.trim().is_empty() && s != "+" {
+                                        diff_lines.push(format!("+ {}", s));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !diff_lines.is_empty() { return Some(diff_lines.join("\n")); }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the inline suggestion diff closest to the given line number.
+    /// Heuristic: scan for each occurrence of "inline-suggestion-view" and look backward
+    /// in HTML for an anchor like C########OL<N>/NL<N>; choose the block with smallest |N - line_number|.
+    // nearest-line heuristic removed in favor of comment-id anchor matching
 
     fn extract_suggestion_from_json(&self, json_response: &str) -> Option<String> {
         // Strip the "for (;;);" prefix that Phabricator adds for security
@@ -1072,18 +1340,60 @@ impl PhabricatorCommentExtractor {
         None
     }
 
+    fn extract_suggestion_from_json_for_line(&self, json_response: &str, line_number: u32, line_length: u32) -> Option<String> {
+        let clean_json = if json_response.starts_with("for (;;);") {
+            &json_response[9..]
+        } else {
+            json_response
+        };
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean_json) {
+            // Walk tree and find objects with `line` (or similar) and `suggestionText`; choose nearest/intersecting
+            let mut best_text: Option<String> = None;
+            let mut best_dist: i64 = i64::MAX;
+            fn visit(value: &serde_json::Value, target_start: u32, target_len: u32, best_dist: &mut i64, best_text: &mut Option<String>) {
+                match value {
+                    serde_json::Value::Object(map) => {
+                        let line = map
+                            .get("line").and_then(|v| v.as_u64()).map(|v| v as u32)
+                            .or_else(|| map.get("lineNumber").and_then(|v| v.as_u64()).map(|v| v as u32))
+                            .or_else(|| map.get("newLine").and_then(|v| v.as_u64()).map(|v| v as u32));
+                        let length = map
+                            .get("length").and_then(|v| v.as_u64()).map(|v| v as u32)
+                            .or_else(|| map.get("len").and_then(|v| v.as_u64()).map(|v| v as u32))
+                            .unwrap_or(1);
+                        let text = map.get("suggestionText").and_then(|v| v.as_str());
+                        if let (Some(l), Some(t)) = (line, text) {
+                            let target_end = target_start + target_len.saturating_sub(1);
+                            let block_end = l + length.saturating_sub(1);
+                            let intersects = block_end >= target_start && l <= target_end;
+                            let d = if intersects { 0 } else { (l as i64 - target_start as i64).abs() };
+                            if !t.trim().is_empty() && d < *best_dist {
+                                *best_dist = d;
+                                *best_text = Some(t.to_string());
+                            }
+                        }
+                        for (_k, v) in map.iter() { visit(v, target_start, target_len, best_dist, best_text); }
+                    }
+                    serde_json::Value::Array(arr) => {
+                        for v in arr { visit(v, target_start, target_len, best_dist, best_text); }
+                    }
+                    _ => {}
+                }
+            }
+            visit(&json, line_number, line_length, &mut best_dist, &mut best_text);
+            if let Some(t) = best_text { return Some(format!("**Suggested changes:**\n\n```diff\n{}\n```", t.trim())); }
+        }
+        None
+    }
+
     fn find_suggestion_text_recursive(&self, value: &serde_json::Value) -> Option<String> {
         match value {
             serde_json::Value::Object(map) => {
                 // Check if this object has suggestionText
                 if let Some(suggestion_text) = map.get("suggestionText") {
                     if let Some(text) = suggestion_text.as_str() {
-                        if !text.trim().is_empty() {
-                            // Look for suggestions that contain actual changes
-                            if text.contains("uuuu") || text.contains("-") || text.contains("+") {
-                                return Some(text.to_string());
-                            }
-                        }
+                        if !text.trim().is_empty() { return Some(text.to_string()); }
                     }
                 }
 
@@ -1117,17 +1427,20 @@ impl PhabricatorCommentExtractor {
         // Look for inline-suggestion-view elements
         if let Ok(suggestion_selector) = Selector::parse(".inline-suggestion-view") {
             let suggestions: Vec<_> = document.select(&suggestion_selector).collect();
+            debug!(".inline-suggestion-view blocks found: {}", suggestions.len());
 
             // Extract suggestions from available suggestion elements
             for suggestion in suggestions.iter() {
                 // Check if this suggestion is marked as "done"
                 let is_done = self.is_suggestion_done(suggestion);
                 if is_done && !include_done {
+                    debug!("skipping DONE suggestion block");
                     continue;
                 }
 
                 // Extract the suggestion content from the table structure
                 if let Some(suggestion_text) = self.extract_suggestion_from_table(suggestion) {
+                    debug!("chose suggestion from HTML table");
                     return Some(suggestion_text);
                 }
             }
@@ -1151,47 +1464,35 @@ impl PhabricatorCommentExtractor {
                 if let Some(payload) = data.get("payload") {
                     if let Some(changeset_html) = payload.get("changeset") {
                         if let Some(html_str) = changeset_html.as_str() {
-                            // Parse HTML and extract diff content
+                            // Parse HTML and extract diff content using cell-specific selectors
                             debug!("Parsing HTML for diff content extraction");
                             let document = Html::parse_document(html_str);
 
-                            // Look for diff rows that show changes
-                            if let Ok(diff_selector) = Selector::parse("tr") {
+                            if let Ok(row_sel) = Selector::parse("tr") {
                                 let mut diff_lines = Vec::new();
-
-                                for row in document.select(&diff_selector) {
-                                    // Look for cells with old (removed) content
-                                    if let Ok(old_selector) = Selector::parse("td.old") {
-                                        if let Some(old_cell) = row.select(&old_selector).next() {
-                                            let text = old_cell
-                                                .text()
-                                                .collect::<String>()
-                                                .trim()
-                                                .to_string();
-                                            if !text.is_empty() {
-                                                diff_lines.push(format!("- {}", text));
-                                            }
+                                for row in document.select(&row_sel) {
+                                    // Old/removed cells
+                                    if let Ok(old_sel) = Selector::parse("td.left.old, td.left.old.old-full, td.old, .diff-old") {
+                                        if let Some(old_cell) = row.select(&old_sel).next() {
+                                            let mut s = old_cell.text().collect::<String>().replace('\u{00A0}', " ");
+                                            s = s.replace('\r', "");
+                                            s = s.replace('\n', "");
+                                            while s.starts_with("- ") { s = s[2..].to_string(); }
+                                            if !s.trim().is_empty() && s != "-" { diff_lines.push(format!("- {}", s)); }
                                         }
                                     }
-
-                                    // Look for cells with new (added) content
-                                    if let Ok(new_selector) = Selector::parse("td.new") {
-                                        if let Some(new_cell) = row.select(&new_selector).next() {
-                                            let text = new_cell
-                                                .text()
-                                                .collect::<String>()
-                                                .trim()
-                                                .to_string();
-                                            if !text.is_empty() {
-                                                diff_lines.push(format!("+ {}", text));
-                                            }
+                                    // New/added cells
+                                    if let Ok(new_sel) = Selector::parse("td.right.new, td.right.new.new-full, td.new, .diff-new") {
+                                        if let Some(new_cell) = row.select(&new_sel).next() {
+                                            let mut s = new_cell.text().collect::<String>().replace('\u{00A0}', " ");
+                                            s = s.replace('\r', "");
+                                            s = s.replace('\n', "");
+                                            while s.starts_with("+ ") { s = s[2..].to_string(); }
+                                            if !s.trim().is_empty() && s != "+" { diff_lines.push(format!("+ {}", s)); }
                                         }
                                     }
                                 }
-
-                                if !diff_lines.is_empty() {
-                                    return Some(diff_lines.join("\n"));
-                                }
+                                if !diff_lines.is_empty() { return Some(diff_lines.join("\n")); }
                             }
                         }
                     }
@@ -1221,30 +1522,22 @@ impl PhabricatorCommentExtractor {
 
                     if let Ok(row_selector) = Selector::parse("tr") {
                         for row in document.select(&row_selector) {
-                            let row_html = row.html();
-                            let row_text = row.text().collect::<String>();
-
-                            // Look for old lines (removed) - check for "left old" class
-                            if row_html.contains("left old") {
-                                // Extract text and clean it up
-                                let cleaned = row_text.trim().trim_start_matches("- ").trim();
-                                if !cleaned.is_empty()
-                                    && !cleaned.contains("break;")
-                                    && !cleaned.contains("}")
-                                {
-                                    diff_lines.push(format!("- {}", cleaned));
+                            if let Ok(old_sel) = Selector::parse("td.left.old, td.left.old.old-full, td.old, .diff-old") {
+                                if let Some(old_cell) = row.select(&old_sel).next() {
+                                    let mut s = old_cell.text().collect::<String>().replace('\u{00A0}', " ");
+                                    s = s.replace('\r', "");
+                                    s = s.replace('\n', "");
+                                    while s.starts_with("- ") { s = s[2..].to_string(); }
+                                    if !s.trim().is_empty() && s != "-" { diff_lines.push(format!("- {}", s)); }
                                 }
                             }
-
-                            // Look for new lines (added) - check for "right new" class
-                            if row_html.contains("right new") {
-                                // Extract text and clean it up
-                                let cleaned = row_text.trim().trim_start_matches("+ ").trim();
-                                if !cleaned.is_empty()
-                                    && !cleaned.contains("break;")
-                                    && !cleaned.contains("}")
-                                {
-                                    diff_lines.push(format!("+ {}", cleaned));
+                            if let Ok(new_sel) = Selector::parse("td.right.new, td.right.new.new-full, td.new, .diff-new") {
+                                if let Some(new_cell) = row.select(&new_sel).next() {
+                                    let mut s = new_cell.text().collect::<String>().replace('\u{00A0}', " ");
+                                    s = s.replace('\r', "");
+                                    s = s.replace('\n', "");
+                                    while s.starts_with("+ ") { s = s[2..].to_string(); }
+                                    if !s.trim().is_empty() && s != "+" { diff_lines.push(format!("+ {}", s)); }
                                 }
                             }
                         }
@@ -1659,6 +1952,7 @@ impl PhabricatorCommentExtractor {
                     let fields = transaction.fields.unwrap_or(serde_json::Value::Null);
                     for comment in transaction.comments {
                         let mut content = comment.content.raw.unwrap_or_default();
+                        // removed debug print
                         if content.is_empty() {
                             // Try to get suggestion content from web interface
                             let line_number =
@@ -1666,21 +1960,28 @@ impl PhabricatorCommentExtractor {
                             let file_path =
                                 fields.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
+                            let line_length =
+                                fields.get("length").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                             if line_number > 0 && !file_path.is_empty() {
                                 if let Some(suggestion) = self
                                     .fetch_suggestion_from_web(
                                         self.current_revision_id.unwrap_or(0),
                                         line_number,
+                                        line_length,
                                         file_path,
                                         include_done,
+                                        &comment.id.to_string(),
                                     )
                                     .await
                                 {
+                                    // removed debug print
                                     content = suggestion;
                                 } else {
+                                    // removed debug print
                                     content = "*[Empty inline comment - likely contains a code suggestion that cannot be extracted via API]*".to_string();
                                 }
                             } else {
+                                // removed debug print
                                 content = "*[Empty inline comment - likely contains a code suggestion that cannot be extracted via API]*".to_string();
                             }
                         }
@@ -1919,7 +2220,7 @@ async fn main() -> Result<()> {
     info!("Starting phab-comments-to-md");
 
     let args = Args::parse();
-    debug!("Parsed arguments: {:?}", args);
+    // reduced debug noise: parsed arguments
 
     // Get token from args or environment variable
     let token = args.token
@@ -1939,12 +2240,12 @@ async fn main() -> Result<()> {
 
     // Determine diff ID and base URL
     let (diff_id, base_url) = if let Some(url) = args.url {
-        debug!("Processing URL: {}", url);
-        let extractor = PhabricatorCommentExtractor::new(String::new(), token.clone());
+        // reduced debug noise
+        let extractor = PhabricatorCommentExtractor::new(String::new(), token.clone(), false);
         let diff_id = extractor
             .extract_diff_id_from_url(&url)
             .context("Could not extract diff ID from URL")?;
-        debug!("Extracted diff_id: {}", diff_id);
+        // reduced debug noise
 
         // Extract base URL from the provided URL
         let parsed_url = Url::parse(&url)?;
@@ -1971,8 +2272,8 @@ async fn main() -> Result<()> {
     };
 
     // Create extractor and process
-    debug!("Creating extractor with base_url: {}", base_url);
-    let mut extractor = PhabricatorCommentExtractor::new(base_url, token);
+    // reduced debug noise
+    let mut extractor = PhabricatorCommentExtractor::new(base_url, token, args.dump_web);
 
     info!(
         "Starting extraction for diff_id: {}, include_done: {}",
