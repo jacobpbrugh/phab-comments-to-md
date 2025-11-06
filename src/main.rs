@@ -260,6 +260,7 @@ impl PhabricatorCommentExtractor {
                 }
             }
             if cookies.contains_key("phsid") && cookies.contains_key("phusr") {
+                debug!("Using PHABRICATOR_COOKIES environment variable for cookies");
                 return Ok(cookies);
             }
         }
@@ -458,6 +459,7 @@ impl PhabricatorCommentExtractor {
             }
         }
 
+        debug!("Fetching CSRF token from {}", url);
         if let Ok(response) = request_builder.send().await {
             if let Ok(html) = response.text().await {
                 // Look for CSRF token in the HTML
@@ -488,6 +490,7 @@ impl PhabricatorCommentExtractor {
         include_done: bool,
         comment_id: &str,
     ) -> Option<String> {
+        debug!("Fetching suggestion from web for comment_id {}", comment_id);
         // Prefer fetching the changeset response that contains this comment's anchor
         if let Some(changeset_data) = self
             .fetch_changeset_data_for_comment(revision_id, file_path, comment_id, include_done)
@@ -512,6 +515,7 @@ impl PhabricatorCommentExtractor {
                 return Some(suggestions);
             }
         }
+        debug!("No suggestion found from web for comment_id {}", comment_id);
         None
     }
 
@@ -1952,8 +1956,11 @@ impl PhabricatorCommentExtractor {
                     let fields = transaction.fields.unwrap_or(serde_json::Value::Null);
                     for comment in transaction.comments {
                         let mut content = comment.content.raw.unwrap_or_default();
+                        debug!("processing inline comment id {} with initial content length {}", comment.id, content.len());
+                        debug!("inline comment content before extraction: {}", content);
                         // removed debug print
                         if content.is_empty() {
+                            debug!("inline comment content is empty, trying to extract suggestion for comment id {}", comment.id);
                             // Try to get suggestion content from web interface
                             let line_number =
                                 fields.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -1974,14 +1981,14 @@ impl PhabricatorCommentExtractor {
                                     )
                                     .await
                                 {
-                                    // removed debug print
+                                    debug!("extracted suggestion from web interface for inline comment {}", comment.id);
                                     content = suggestion;
                                 } else {
-                                    // removed debug print
+                                    debug!("no suggestion found in web interface for inline comment, bad response {}", comment.id);
                                     content = "*[Empty inline comment - likely contains a code suggestion that cannot be extracted via API]*".to_string();
                                 }
                             } else {
-                                // removed debug print
+                                debug!("no suggestion found in web interface for inline comment, bad line no or file path {}", comment.id);
                                 content = "*[Empty inline comment - likely contains a code suggestion that cannot be extracted via API]*".to_string();
                             }
                         }
